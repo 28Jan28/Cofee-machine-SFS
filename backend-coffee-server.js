@@ -13,7 +13,7 @@ const { MongoClient } = require('mongodb');
 
 // Inicializace Express aplikace
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/coffee-system';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
@@ -37,19 +37,86 @@ const logger = winston.createLogger({
   ],
 });
 
-// Redis klient pro cache
+// Redis klient pro cache - aktualizovaná verze
 let redisClient;
 (async () => {
-  redisClient = createClient({ url: REDIS_URL });
-  redisClient.on('error', (err) => logger.error('Redis Client Error', err));
-  await redisClient.connect();
+  try {
+    redisClient = createClient({
+      url: REDIS_URL,
+      socket: {
+        reconnectStrategy: (retries) => {
+          if (retries > 10) {
+            console.error('Redis connection failed after 10 retries');
+            return false;
+          }
+          return Math.min(retries * 100, 3000);
+        }
+      }
+    });
+
+    redisClient.on('error', (err) => {
+      console.error('Redis Client Error:', err);
+      logger.error('Redis Client Error:', err);
+    });
+
+    redisClient.on('connect', () => {
+      console.log('Redis Client Connected');
+      logger.info('Redis Client Connected');
+    });
+
+    await redisClient.connect();
+  } catch (err) {
+    console.error('Redis initialization error:', err);
+    logger.error('Redis initialization error:', err);
+    // Continue without Redis if it fails
+    redisClient = {
+      isOpen: false,
+      get: async () => null,
+      set: async () => {},
+      del: async () => {},
+      ping: async () => false
+    };
+  }
 })();
 
 // Middleware
+// Přidej tento kód před ostatní middleware
+app.use((req, res, next) => {
+    res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+    );
+    next();
+});
 app.use(helmet()); // Bezpečnostní hlavičky
 app.use(cors());
 app.use(express.json());
+// Servírování statických souborů
+app.use(express.static(path.join(__dirname, 'public')));
 
+// Základní routa
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Fallback routa pro SPA (Single Page Application)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Přidej tento kód k ostatním routám
+
+// Health check endpoint
+app.get('/api/v1/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    services: {
+      mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+      redis: redisClient.isOpen ? 'connected' : 'disconnected'
+    }
+  });
+});
 // Rate limiting - prevence DDoS útoku
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minut
@@ -353,3 +420,78 @@ app.post('/api/v1/sync-transactions', async (req, res) => {
     await session.abortTransaction();
     logger.error('Error syncing transactions', err);
     res.status
+    await session.abortTransaction();
+    logger.error('Error syncing transactions', err);
+    res.status(500).json({ error: 'Failed to sync transactions' });
+  } finally {
+    session.endSession();
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  logger.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received. Starting graceful shutdown...');
+  
+  try {
+    // Close database connection
+    await mongoose.disconnect();
+    logger.info('MongoDB disconnected');
+    
+    // Close Redis connection
+    await redisClient.quit();
+    logger.info('Redis disconnected');
+    
+    process.exit(0);
+  } catch (err) {
+    logger.error('Error during shutdown:', err);
+    process.exit(1);
+  }
+});
+
+// Start server
+const server = app.listen(PORT, () => {
+  logger.info(`Server running on port ${PORT}`);
+  logger.info(`Environment: ${process.env.NODE_ENV}`);
+});
+// Health check endpoint
+app.get('/api/v1/health', async (req, res) => {
+  try {
+    // Test MongoDB connection
+    const mongoStatus = mongoose.connection.readyState;
+    
+    // Test Redis connection
+    const redisStatus = await redisClient.ping().then(() => true).catch(() => false);
+    
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      services: {
+        mongodb: {
+          status: mongoStatus === 1 ? 'connected' : 'disconnected',
+          readyState: mongoStatus
+        },
+        redis: {
+          status: redisStatus ? 'connected' : 'disconnected',
+          isOpen: redisStatus
+        }
+      },
+      environment: process.env.NODE_ENV,
+      version: process.version
+    });
+  } catch (err) {
+    console.error('Health check error:', err);
+    res.status(500).json({
+      status: 'error',
+      timestamp: new Date().toISOString(),
+      error: err.message
+    });
+  }
+});
+
+module.exports = { app, server };
